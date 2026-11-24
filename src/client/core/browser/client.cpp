@@ -1,3 +1,4 @@
+#include "browser/game_settings.hpp"
 #include "client.hpp"
 
 #include <vector>
@@ -213,6 +214,28 @@ bool BrowserClient::OnProcessMessageReceived(CefRefPtr<CefBrowser> /*browser*/,
                 bool has_focus = args->GetBool(1);
                 focus_->SetInputFocus(browserId_, has_focus);
             }
+            return true;
+        }
+
+        // Next-Vision: setarile GTA (taste, mouse, sunet, grafica) se aplica local, nu se trimit la server.
+        // JS: cef.emit('gta:get') | cef.emit('gta:set', cheie, valoare)  ->  cef.on('gta:state', json)
+        if (GameSettings::IsSettingsEvent(event_name))
+        {
+            auto argText = [&](size_t i) -> std::string {
+                if (args->GetSize() <= i) return {};
+                switch (args->GetType(i))
+                {
+                    case VTYPE_STRING: return args->GetString(i).ToString();
+                    case VTYPE_INT:    return std::to_string(args->GetInt(i));
+                    case VTYPE_DOUBLE: return std::to_string(static_cast<int>(args->GetDouble(i)));
+                    case VTYPE_BOOL:   return args->GetBool(i) ? "1" : "0";
+                    default:           return {};
+                }
+            };
+            if (event_name == "gta:set")
+                GameSettings::Instance().Enqueue(browserId_, argText(1), argText(2));
+            else
+                GameSettings::Instance().Enqueue(browserId_, std::string(), std::string());
             return true;
         }
 

@@ -12,6 +12,7 @@
 #include <windowsx.h>
 
 #include "app.hpp"
+#include "game_settings.hpp"
 #include "audio.hpp"
 #include "client.hpp"
 #include "focus.hpp"
@@ -2527,6 +2528,12 @@ void BrowserManager::TickGameData()
 {
     if (!initialized_)
         return;
+
+    // Next-Vision: setarile GTA cerute din pagini (pe firul jocului)
+    {
+        BrowsersLock settings_lock(browsers_mutex_);
+        GameSettings::Instance().Tick(*this);
+    }
 
     BrowsersLock browsers_lock(browsers_mutex_);
 
