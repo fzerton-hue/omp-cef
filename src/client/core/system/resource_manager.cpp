@@ -3,6 +3,7 @@
 #include <cctype>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <string_view>
 
 #include <miniz.h>
@@ -139,6 +140,56 @@ void ResourceManager::SetNetworkManager(NetworkManager& net)
 	net_ = &net;
 }
 
+// ---------------------------------------------------------------------------------------------
+// Next-Vision: interfete locale, puse de launcher in <joc>\cef\ui\<resursa>\ .
+// Daca folderul exista, resursa NU se mai descarca in joc, iar http://cef/<resursa>/... se citeste
+// direct de pe disc (instant). Fara folder (jucator fara launcher), totul merge ca inainte, de la server.
+// ---------------------------------------------------------------------------------------------
+static std::filesystem::path LocalUiRoot()
+{
+	static const std::filesystem::path root = [] {
+		wchar_t exe_path[MAX_PATH]{};
+		::GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
+		return std::filesystem::path(exe_path).parent_path() / "cef" / "ui";
+	}();
+	return root;
+}
+
+static bool HasLocalUi(const std::string& resourceName)
+{
+	if (resourceName.empty() || resourceName.find("..") != std::string::npos ||
+		resourceName.find_first_of("/\\:") != std::string::npos)
+		return false;
+	std::error_code ec;
+	const auto dir = LocalUiRoot() / resourceName;
+	return std::filesystem::is_directory(dir, ec) && !std::filesystem::is_empty(dir, ec);
+}
+
+// citeste <joc>\cef\ui\<resursa>\<cale>; refuza caile care ies din folderul resursei
+static bool ReadLocalUiFile(const std::string& resourceName, const std::string& internalPath, std::vector<uint8_t>& out)
+{
+	if (!HasLocalUi(resourceName) || internalPath.empty())
+		return false;
+
+	std::error_code ec;
+	const auto base = std::filesystem::weakly_canonical(LocalUiRoot() / resourceName, ec);
+	if (ec) return false;
+	const auto full = std::filesystem::weakly_canonical(base / std::filesystem::path(std::u8string(internalPath.begin(), internalPath.end())), ec);
+	if (ec) return false;
+
+	const auto rel = full.lexically_relative(base);
+	if (rel.empty() || *rel.begin() == "..")
+		return false;
+	if (!std::filesystem::is_regular_file(full, ec))
+		return false;
+
+	std::ifstream file(full, std::ios::binary);
+	if (!file)
+		return false;
+	out.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+	return true;
+}
+
 void ResourceManager::SetDownloadDialog(DownloadDialog& dialog)
 {
     download_dialog_ = &dialog;
@@ -236,6 +287,11 @@ void ResourceManager::TriggerDownload()
 	const nlohmann::json manifest = server_manifest_.is_object() ? server_manifest_ : nlohmann::json::object();
 
 	for (const auto& [resourceName, files] : manifest.items()) {
+		if (HasLocalUi(resourceName)) {
+			LOG_INFO("[ResourceManager] Resource '{}' is installed locally (cef/ui), skipping download.", resourceName);
+			continue;
+		}
+
 		if (!files.is_array()) {
 			LOG_ERROR("[ResourceManager] Ignoring resource '{}': invalid manifest entry", resourceName);
 			continue;
@@ -557,6 +613,10 @@ bool ResourceManager::GetFileContent(const std::string& resourceName,
 	const std::string& internalPath,
 	std::vector<uint8_t>& outContent)
 {
+	// interfata locala (launcher) are prioritate
+	if (ReadLocalUiFile(resourceName, internalPath, outContent))
+		return true;
+
 	std::lock_guard<std::mutex> lock(vfs_mutex_);
 
 	auto it = loaded_resources_vfs_.find(resourceName);
