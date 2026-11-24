@@ -584,6 +584,10 @@ void BrowserManager::CreateBrowser(
 {
     LOG_DEBUG("[CEF] CreateBrowser called with ID={}, url={}", id, url);
 
+    // Next-Vision: fereastra e deja preincarcata -> o predam gamemode-ului
+    if (TryClaimPreloaded(id, url, focused, controls_chat))
+        return;
+
     {
         BrowsersLock lock(browsers_mutex_);
         if (const auto it = browsers_.find(id); it != browsers_.end())
@@ -1066,6 +1070,13 @@ void BrowserManager::ReleaseRetiredResources()
 
 void BrowserManager::DestroyAllBrowsers()
 {
+    {
+        BrowsersLock lock(browsers_mutex_);
+        preload_queue_.clear();
+        preloaded_.clear();
+        claim_pending_.clear();
+    }
+
     if (!CefCurrentlyOn(TID_UI))
     {
         CefPostTask(TID_UI, base::BindOnce(&BrowserManager::DestroyAllBrowsers, base::Unretained(this)));
@@ -1262,6 +1273,25 @@ void BrowserManager::OnBrowserCreated(int id, CefRefPtr<CefBrowser> browser)
     if (it != browsers_.end())
     {
         it->second->browser = browser;
+
+        // Next-Vision: preincarcata, inca nepreluata -> ramane ascunsa, serverul nu afla de ea
+        if (preloaded_.count(id))
+        {
+            if (auto host = browser->GetHost()) host->WasHidden(true);
+            LOG_DEBUG("[CEF] Preload: fereastra {} e gata (ascunsa).", id);
+            return;
+        }
+        // preluata de gamemode cat timp se crea: acum incarcam pagina ceruta si raspundem
+        if (const auto cp = claim_pending_.find(id); cp != claim_pending_.end())
+        {
+            const std::string url = cp->second;
+            claim_pending_.erase(cp);
+            it->second->visible = true;
+            if (auto host = browser->GetHost()) { host->WasHidden(false); host->WasResized(); host->Invalidate(PET_VIEW); }
+            if (auto frame = browser->GetMainFrame()) frame->LoadURL(url);
+            network_.SendBrowserCreateResult(id, true, static_cast<int>(BrowserCreateStatus::Success), "Successfully created");
+            return;
+        }
         if (auto host = browser->GetHost())
         {
             host->WasResized();
@@ -1282,6 +1312,8 @@ void BrowserManager::OnBrowserClosed(int id)
     screen_capture_.Stop(id);
 
     BrowsersLock lock(browsers_mutex_);
+    preloaded_.erase(id);
+    claim_pending_.erase(id);
     player_stats_poll_.erase(id);
     pending_.erase(id);
     RetireBrowserLocked(id);
@@ -2529,6 +2561,8 @@ void BrowserManager::TickGameData()
     if (!initialized_)
         return;
 
+    TickPreload();
+
     // Next-Vision: setarile GTA cerute din pagini (pe firul jocului)
     {
         BrowsersLock settings_lock(browsers_mutex_);
@@ -2685,4 +2719,83 @@ void BrowserManager::TickGameData()
 
         ++it;
     }
+}
+
+/* =====================================================================
+   Next-Vision: preincarcarea ferestrelor (preload.json din interfata locala)
+   ===================================================================== */
+void BrowserManager::QueuePreload(std::vector<std::pair<int, std::string>> list)
+{
+    BrowsersLock lock(browsers_mutex_);
+    preload_queue_ = std::move(list);
+    next_preload_ms_ = 0;
+    LOG_INFO("[CEF] Preload: {} ferestre de preincarcat.", preload_queue_.size());
+}
+
+// pe firul jocului: o fereastra la 150 ms, ca sa nu apara un sughit la intrare
+void BrowserManager::TickPreload()
+{
+    int id = -1;
+    std::string url;
+    {
+        BrowsersLock lock(browsers_mutex_);
+        if (preload_queue_.empty()) return;
+        const uint64_t now = ::GetTickCount64();
+        if (now < next_preload_ms_) return;
+        next_preload_ms_ = now + 150;
+
+        id = preload_queue_.front().first;
+        url = preload_queue_.front().second;
+        preload_queue_.erase(preload_queue_.begin());
+
+        if (browsers_.count(id)) return;            // gamemode-ul a creat-o deja
+        preloaded_.insert(id);
+    }
+
+    CreateBrowserInternal(id, url, false, false, 0.0f, 0.0f);
+    SetBrowserVisible(id, false);                   // ajunge pe firul UI dupa creare: ascunsa de la inceput
+}
+
+bool BrowserManager::TryClaimPreloaded(int id, const std::string& url, bool focused, bool controls_chat)
+{
+    {
+        BrowsersLock lock(browsers_mutex_);
+
+        // inca la coada: o scoatem, iar gamemode-ul o creeaza normal
+        preload_queue_.erase(std::remove_if(preload_queue_.begin(), preload_queue_.end(),
+            [id](const auto& p) { return p.first == id; }), preload_queue_.end());
+
+        if (!preloaded_.count(id))
+            return false;
+        preloaded_.erase(id);
+
+        auto* inst = GetBrowserInstance(id);
+        if (!inst)
+            return false;                           // a disparut intre timp: creare normala
+
+        inst->url = url;
+        inst->controls_chat_input = controls_chat;
+
+        if (!inst->browser)
+        {
+            // inca se creeaza: OnBrowserCreated incarca pagina si raspunde serverului
+            claim_pending_[id] = url;
+            LOG_DEBUG("[CEF] Preload: fereastra {} preluata inainte sa fie gata.", id);
+            return true;
+        }
+    }
+
+    LoadUrl(id, url);                               // pagina proaspata (fisierele sunt deja in memorie)
+    SetBrowserVisible(id, true);                    // ca la o fereastra noua; gamemode-ul o ascunde/arata dupa
+    if (focused)
+        FocusBrowser(id, true);
+    network_.SendBrowserCreateResult(id, true, static_cast<int>(BrowserCreateStatus::Success), "Successfully created");
+    LOG_DEBUG("[CEF] Preload: fereastra {} predata gamemode-ului ({}).", id, url);
+    return true;
+}
+
+bool BrowserManager::IsPreloadedUnclaimed(int id) const
+{
+    BrowsersLock lock(browsers_mutex_);
+    return preloaded_.count(id) != 0;
 }

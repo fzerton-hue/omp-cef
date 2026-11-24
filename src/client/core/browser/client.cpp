@@ -217,6 +217,11 @@ bool BrowserClient::OnProcessMessageReceived(CefRefPtr<CefBrowser> /*browser*/,
             return true;
         }
 
+        // Next-Vision: fereastra preincarcata, inca nepreluata de gamemode -> nu trimitem nimic la server
+        // (la preluare pagina se reincarca si isi trimite din nou "ready")
+        if (manager_.IsPreloadedUnclaimed(browserId_) && !GameSettings::IsSettingsEvent(event_name))
+            return true;
+
         // Next-Vision: setarile GTA (taste, mouse, sunet, grafica) se aplica local, nu se trimit la server.
         // JS: cef.emit('gta:get') | cef.emit('gta:set', cheie, valoare)  ->  cef.on('gta:state', json)
         if (GameSettings::IsSettingsEvent(event_name))

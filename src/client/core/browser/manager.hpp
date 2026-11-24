@@ -7,6 +7,7 @@
 #include <mutex>
 #include <cstdint>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "client.hpp"
@@ -140,6 +141,13 @@ public:
     void SetBrowserLayer(int id, int layer);
     void DestroyBrowser(int id);
     void DestroyAllBrowsers();
+
+    // Next-Vision: preincarcare. Ferestrele din preload.json se creeaza ascunse la intrare, fara sa anunte serverul.
+    // Cand gamemode-ul cere una (CEF_CreateBrowser), e "preluata": pagina ceruta se incarca instant si serverul
+    // primeste "creata", exact ca la o creare normala.
+    void QueuePreload(std::vector<std::pair<int, std::string>> list);
+    void TickPreload();
+    bool IsPreloadedUnclaimed(int id) const;   // pagina preincarcata, inca a nimanui: nu vorbeste cu serverul
     void ReloadBrowser(int id, bool ignoreCache);
     void LoadUrl(int id, const std::string& url);
     void SetDevToolsEnabled(int browserId, bool enabled);
@@ -314,6 +322,13 @@ private:
     std::bitset<256> key_allowed_{};
 
     std::unordered_map<int, PlayerStatsPollState> player_stats_poll_;
+
+    // preincarcare (toate protejate de browsers_mutex_)
+    std::vector<std::pair<int, std::string>> preload_queue_;
+    std::unordered_set<int> preloaded_;        // create de client, inca nepreluate de server
+    std::unordered_map<int, std::string> claim_pending_;   // preluate inainte sa fie gata: url de incarcat
+    uint64_t next_preload_ms_ = 0;
+    bool TryClaimPreloaded(int id, const std::string& url, bool focused, bool controls_chat);
     ScreenCaptureManager screen_capture_;
 
     // Native GTA SA ESC/pause menu handling
