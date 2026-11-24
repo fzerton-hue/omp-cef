@@ -74,6 +74,7 @@ private:
 
     bool ResourcesReady() const;
     void FlushPendingIfReady();
+    void StartPreload();          // Next-Vision: preincarca ferestrele din preload.json
     
     void RemovePendingCreate(int id);
     void QueueOrCreateOverlay(int id, const std::string& url, bool focused, bool controls_chat, float width, float height);

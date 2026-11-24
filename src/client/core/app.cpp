@@ -109,6 +109,35 @@ bool App::ResourcesReady() const
     return resources_.GetState() == DownloadState::COMPLETED;
 }
 
+// Next-Vision: <interfata>/preload.json -> { "browsers": [ { "id": 1017, "url": "http://cef/nextvision/bank/index.html" }, ... ] }
+void App::StartPreload()
+{
+    std::vector<std::pair<int, std::string>> list;
+    for (const auto& res : ResourceManager::LocalUiResources())
+    {
+        std::vector<uint8_t> data;
+        if (!resources_.GetFileContent(res, "preload.json", data))
+            continue;
+        try
+        {
+            const auto j = nlohmann::json::parse(data.begin(), data.end());
+            for (const auto& b : j.value("browsers", nlohmann::json::array()))
+            {
+                if (!b.contains("id") || !b.contains("url") || !b["id"].is_number_integer() || !b["url"].is_string())
+                    continue;
+                if (b.value("preload", true))
+                    list.emplace_back(b["id"].get<int>(), b["url"].get<std::string>());
+            }
+        }
+        catch (const std::exception& e)
+        {
+            LOG_ERROR("[CEF] Preload: {}/preload.json invalid: {}", res, e.what());
+        }
+    }
+    if (!list.empty())
+        browser_.QueuePreload(std::move(list));
+}
+
 void App::FlushPendingIfReady()
 {
     if (!ResourcesReady())
@@ -118,6 +147,7 @@ void App::FlushPendingIfReady()
     {
         flushed_once_ = true;
         network_.SendPacket(PacketType::DownloadComplete, {});
+        StartPreload();
         std::lock_guard<std::mutex> lock(pending_creates_mutex_);
         LOG_DEBUG("[CEF] Resources completed -> flushing pending creates={}, emits={}.", (int)pending_creates_.size(), (int)pending_emits_.size());
     }
