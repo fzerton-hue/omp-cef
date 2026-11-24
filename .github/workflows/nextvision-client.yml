@@ -1,0 +1,20 @@
+name: Next-Vision - compileaza client.dll
+
+# Apasa "Run workflow" din tab-ul Actions. Dupa ~30-40 min, jos la "Artifacts" descarci:
+#   client-files-v1.4.1-nv     = tot folderul cef (client.dll, renderer.exe, cef.asi + fisierele CEF)
+#   individual-files-v1.4.1-nv = doar client.dll, renderer.exe si cef.asi
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-client:
+    name: Build client.dll (Next-Vision)
+    uses: ./.github/workflows/build-client-reusable.yml
+    with:
+      version: 1.4.1-nv
+      cef-version: 158.0.3+g8c29be2+chromium-158.0.8127.18
+      cef-arch: windows32
+      build-type: Release
