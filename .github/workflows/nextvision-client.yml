@@ -1,8 +1,8 @@
 name: Next-Vision - compileaza client.dll
 
-# Apasa "Run workflow" din tab-ul Actions. Dupa ~30-40 min, jos la "Artifacts" descarci:
-#   client-files-v1.4.1-nv     = tot folderul cef (client.dll, renderer.exe, cef.asi + fisierele CEF)
-#   individual-files-v1.4.1-nv = doar client.dll, renderer.exe si cef.asi
+# Actions -> "Next-Vision - compileaza client.dll" -> Run workflow.
+# La final, jos la "Artifacts": client-files-v1.4.1-nv (tot folderul cef + cef.asi).
+# Cheia interfetelor criptate vine din secretul NV_UI_KEY (Settings -> Secrets and variables -> Actions).
 on:
   workflow_dispatch:
 
@@ -12,9 +12,128 @@ permissions:
 jobs:
   build-client:
     name: Build client.dll (Next-Vision)
-    uses: ./.github/workflows/build-client-reusable.yml
-    with:
-      version: 1.4.1-nv
-      cef-version: 158.0.3+g8c29be2+chromium-158.0.8127.18
-      cef-arch: windows32
-      build-type: Release
+    runs-on: windows-latest
+
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}\vcpkg
+
+    steps:
+      - uses: actions/checkout@v4
+        with: { submodules: recursive }
+
+      - name: Cache vcpkg (archives + installed)
+        uses: actions/cache@v4
+        id: cache-vcpkg
+        with:
+          path: |
+            C:\Users\runneradmin\AppData\Local\vcpkg\archives
+            ${{ github.workspace }}\vcpkg_installed
+            ${{ env.VCPKG_ROOT }}
+          key: vcpkg-client-${{ runner.os }}-x86-Release-${{ hashFiles('vcpkg.json') }}
+
+      - name: Bootstrap vcpkg
+        if: steps.cache-vcpkg.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          git clone https://github.com/microsoft/vcpkg.git "${{ env.VCPKG_ROOT }}"
+          cd "${{ env.VCPKG_ROOT }}"
+          .\bootstrap-vcpkg.bat
+
+      - name: Restore CEF cache
+        uses: ./.github/actions/setup-cef
+        with:
+          cef-version: 158.0.3+g8c29be2+chromium-158.0.8127.18
+          cef-arch:    windows32
+
+      - name: Next-Vision - cheia interfetelor (din secretul NV_UI_KEY)
+        shell: bash
+        env:
+          NV_UI_KEY: ${{ secrets.NV_UI_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${NV_UI_KEY:-}" ]; then
+            echo "::warning::Secretul NV_UI_KEY lipseste: client.dll nu va putea citi interfetele criptate (.nvpak)."
+            exit 0
+          fi
+          python - <<'PY'
+          import os
+          k = bytes.fromhex(os.environ["NV_UI_KEY"].strip())
+          assert len(k) == 32, "NV_UI_KEY trebuie sa aiba 64 de caractere hex"
+          a = os.urandom(32); b = bytes(x ^ y for x, y in zip(k, a))
+          f = lambda bs: ", ".join("0x%02X" % x for x in bs)
+          open("src/client/core/system/nv_ui_key.hpp", "w").write(
+              "// generat la compilare din secretul NV_UI_KEY - NU il urca in repo\n#pragma once\n"
+              "static constexpr uint8_t kPakKeyA[32] = { %s };\nstatic constexpr uint8_t kPakKeyB[32] = { %s };\n" % (f(a), f(b)))
+          print("cheia interfetelor a fost pusa in client.dll")
+          PY
+
+      - name: Configure and Build Client
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VCPKG_TOOLCHAIN_FILE="${{ env.VCPKG_ROOT }}/scripts/buildsystems/vcpkg.cmake"
+
+          cmake -B build -S . \
+            -DCMAKE_BUILD_TYPE=Release -A Win32 \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+            -DCMAKE_TOOLCHAIN_FILE="$VCPKG_TOOLCHAIN_FILE" \
+            -DVCPKG_FEATURE_FLAGS=manifests\;binarycaching \
+            -DVCPKG_MANIFEST_FEATURES=client \
+            -DVCPKG_TARGET_TRIPLET=x86-windows-static \
+            -DDEV_ALL_TARGETS=OFF \
+            -DBUILD_CLIENT=ON \
+            -DBUILD_SERVER_OMP=OFF \
+            -DBUILD_SERVER_SAMP=OFF
+
+          cmake --build build --config Release --parallel
+
+      - name: Package client files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BUILD_DIR="build"
+          CFG="Release"
+
+          CLIENT_DLL="${BUILD_DIR}/src/client/core/${CFG}/client.dll"
+          LOADER_ASI="${BUILD_DIR}/src/client/loader/${CFG}/cef.asi"
+          RENDERER_EXE="${BUILD_DIR}/src/client/renderer/${CFG}/Renderer.exe"
+
+          rm -rf package && mkdir -p package/cef
+
+          # Copy CEF distribution
+          CEF_ROOT_PATH="deps/cef/cef_binary_158.0.3+g8c29be2+chromium-158.0.8127.18_windows32"
+          test -d "${CEF_ROOT_PATH}" || (echo "CEF not found at ${CEF_ROOT_PATH}" && exit 1)
+
+          cp -R "${CEF_ROOT_PATH}/Release/"* package/cef/
+          cp -R "${CEF_ROOT_PATH}/Resources/"* package/cef/
+          rm -f package/cef/bootstrap.exe package/cef/bootstrapc.exe || true
+
+          # Copy client binaries
+          test -f "$CLIENT_DLL" || (echo "Missing $CLIENT_DLL" && exit 1)
+          test -f "$LOADER_ASI" || (echo "Missing $LOADER_ASI" && exit 1)
+          test -f "$RENDERER_EXE" || (echo "Missing $RENDERER_EXE" && exit 1)
+
+          cp "$CLIENT_DLL" package/cef/client.dll
+          cp "$LOADER_ASI" package/cef.asi
+          cp "$RENDERER_EXE" package/cef/renderer.exe
+
+      - name: Compress client files
+        shell: pwsh
+        run: Compress-Archive -Path package/* -DestinationPath client-files-v1.4.1-nv.zip -Force
+
+      - name: Upload Client Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: client-files-v1.4.1-nv
+          path: client-files-v1.4.1-nv.zip
+
+      - name: Upload Individual Files
+        uses: actions/upload-artifact@v4
+        with:
+          name: individual-files-v1.4.1-nv
+          path: |
+            package/cef/client.dll
+            package/cef/renderer.exe
+            package/cef.asi
