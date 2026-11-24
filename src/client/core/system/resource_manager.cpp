@@ -3,6 +3,11 @@
 #include <cctype>
 #include <filesystem>
 #include <fstream>
+#include <sodium.h>
+#include <mutex>
+#include <memory>
+#include <map>
+#include <cstring>
 #include <iterator>
 #include <string_view>
 
@@ -141,38 +146,148 @@ void ResourceManager::SetNetworkManager(NetworkManager& net)
 }
 
 // ---------------------------------------------------------------------------------------------
-// Next-Vision: interfete locale, puse de launcher in <joc>\cef\ui\<resursa>\ .
-// Daca folderul exista, resursa NU se mai descarca in joc, iar http://cef/<resursa>/... se citeste
-// direct de pe disc (instant). Fara folder (jucator fara launcher), totul merge ca inainte, de la server.
+// Next-Vision: interfete locale, puse de launcher in <joc>\\cef\\ui\\ .
+//   <resursa>.nvpak  - interfata criptata (ChaCha20-Poly1305, vezi tools/nv-ui-pack.py); se decripteaza in memorie
+//   <resursa>\\       - folder necriptat (doar pentru teste / dezvoltare)
+// Daca exista oricare, resursa NU se mai descarca in joc, iar http://cef/<resursa>/... se citeste local.
+// Fara ele (jucator fara launcher), totul merge ca inainte, de la server.
 // ---------------------------------------------------------------------------------------------
-static std::filesystem::path LocalUiRoot()
+namespace nvui
 {
-	static const std::filesystem::path root = [] {
-		wchar_t exe_path[MAX_PATH]{};
-		::GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
-		return std::filesystem::path(exe_path).parent_path() / "cef" / "ui";
-	}();
-	return root;
+// Cheia NU e in sursa (fork-ul de pe GitHub e public): nv_ui_key.hpp e generat la compilare din
+// secretul NV_UI_KEY (vezi .github/workflows/nextvision-client.yml). Fara el, pachetele .nvpak nu se pot citi.
+#if __has_include("nv_ui_key.hpp")
+	#include "nv_ui_key.hpp"
+	constexpr bool kHasPakKey = true;
+#else
+	static constexpr uint8_t kPakKeyA[32] = {};
+	static constexpr uint8_t kPakKeyB[32] = {};
+	constexpr bool kHasPakKey = false;
+#endif
+
+	using Files = std::map<std::string, std::vector<uint8_t>>;
+
+	std::filesystem::path Root()
+	{
+		static const std::filesystem::path root = [] {
+			wchar_t exe_path[MAX_PATH]{};
+			::GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
+			return std::filesystem::path(exe_path).parent_path() / "cef" / "ui";
+		}();
+		return root;
+	}
+
+	bool SafeName(const std::string& name)
+	{
+		return !name.empty() && name.find("..") == std::string::npos &&
+			name.find_first_of("/\\:") == std::string::npos;
+	}
+
+	uint32_t U32(const uint8_t* p) { return p[0] | (p[1] << 8) | (p[2] << 16) | (static_cast<uint32_t>(p[3]) << 24); }
+
+	// citeste si decripteaza tot pachetul; un singur fisier stricat = pachet respins (nu folosim jumatati)
+	bool LoadPak(const std::filesystem::path& path, Files& out)
+	{
+		std::ifstream f(path, std::ios::binary);
+		if (!f) return false;
+		std::vector<uint8_t> b((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+		if (!kHasPakKey) { LOG_ERROR("[ResourceManager] client.dll compilat fara cheia NV_UI_KEY - nu pot citi {}", path.string()); return false; }
+		if (b.size() < 12 || std::memcmp(b.data(), "NVPAK1\0\0", 8) != 0) return false;
+		if (sodium_init() < 0) return false;
+
+		uint8_t key[32];
+		for (int i = 0; i < 32; ++i) key[i] = kPakKeyA[i] ^ kPakKeyB[i];
+
+		const uint32_t count = U32(&b[8]);
+		size_t off = 12;
+		Files files;
+		bool ok = true;
+		for (uint32_t i = 0; i < count && ok; ++i)
+		{
+			if (off + 2 > b.size()) { ok = false; break; }
+			const uint16_t nlen = static_cast<uint16_t>(b[off] | (b[off + 1] << 8)); off += 2;
+			if (off + nlen + 4 > b.size()) { ok = false; break; }
+			std::string name(reinterpret_cast<const char*>(&b[off]), nlen); off += nlen;
+			const uint32_t blen = U32(&b[off]); off += 4;
+			const size_t nonce = crypto_aead_chacha20poly1305_ietf_NPUBBYTES;
+			const size_t mac = crypto_aead_chacha20poly1305_ietf_ABYTES;
+			if (blen < nonce + mac || off + blen > b.size()) { ok = false; break; }
+
+			std::vector<uint8_t> plain(blen - nonce - mac);
+			unsigned long long plen = 0;
+			if (crypto_aead_chacha20poly1305_ietf_decrypt(plain.data(), &plen, nullptr,
+					&b[off + nonce], blen - nonce,
+					reinterpret_cast<const unsigned char*>(name.data()), name.size(),
+					&b[off], key) != 0)
+			{ ok = false; break; }
+			plain.resize(static_cast<size_t>(plen));
+			files[std::move(name)] = std::move(plain);
+			off += blen;
+		}
+		sodium_memzero(key, sizeof key);
+		if (!ok) return false;
+		out = std::move(files);
+		return true;
+	}
+
+	std::mutex mutex;
+	std::map<std::string, std::shared_ptr<Files>> paks;   // resursa -> continut (nullptr = pachet lipsa / stricat)
+
+	std::shared_ptr<Files> Pak(const std::string& resourceName)
+	{
+		std::lock_guard<std::mutex> lock(mutex);
+		auto it = paks.find(resourceName);
+		if (it != paks.end()) return it->second;
+
+		std::shared_ptr<Files> files;
+		const auto path = Root() / (resourceName + ".nvpak");
+		std::error_code ec;
+		if (std::filesystem::is_regular_file(path, ec))
+		{
+			auto loaded = std::make_shared<Files>();
+			if (LoadPak(path, *loaded))
+			{
+				LOG_INFO("[ResourceManager] Interfata locala criptata '{}' incarcata ({} fisiere).", resourceName, loaded->size());
+				files = loaded;
+			}
+			else
+				LOG_ERROR("[ResourceManager] Pachetul '{}' e stricat sau cheia nu se potriveste.", path.string());
+		}
+		paks[resourceName] = files;
+		return files;
+	}
 }
 
 static bool HasLocalUi(const std::string& resourceName)
 {
-	if (resourceName.empty() || resourceName.find("..") != std::string::npos ||
-		resourceName.find_first_of("/\\:") != std::string::npos)
+	if (!nvui::SafeName(resourceName))
 		return false;
+	if (nvui::Pak(resourceName))
+		return true;
 	std::error_code ec;
-	const auto dir = LocalUiRoot() / resourceName;
+	const auto dir = nvui::Root() / resourceName;
 	return std::filesystem::is_directory(dir, ec) && !std::filesystem::is_empty(dir, ec);
 }
 
-// citeste <joc>\cef\ui\<resursa>\<cale>; refuza caile care ies din folderul resursei
+// pachetul criptat are prioritate; altfel folderul necriptat (refuza caile care ies din el)
 static bool ReadLocalUiFile(const std::string& resourceName, const std::string& internalPath, std::vector<uint8_t>& out)
 {
-	if (!HasLocalUi(resourceName) || internalPath.empty())
+	if (!nvui::SafeName(resourceName) || internalPath.empty())
 		return false;
 
+	if (auto pak = nvui::Pak(resourceName))
+	{
+		auto it = pak->find(internalPath);
+		if (it == pak->end()) return false;
+		out = it->second;
+		return true;
+	}
+
 	std::error_code ec;
-	const auto base = std::filesystem::weakly_canonical(LocalUiRoot() / resourceName, ec);
+	const auto dir = nvui::Root() / resourceName;
+	if (!std::filesystem::is_directory(dir, ec))
+		return false;
+	const auto base = std::filesystem::weakly_canonical(dir, ec);
 	if (ec) return false;
 	const auto full = std::filesystem::weakly_canonical(base / std::filesystem::path(std::u8string(internalPath.begin(), internalPath.end())), ec);
 	if (ec) return false;
