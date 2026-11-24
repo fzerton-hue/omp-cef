@@ -1,5 +1,6 @@
 ﻿#include "resource_manager.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <filesystem>
 #include <fstream>
@@ -303,6 +304,21 @@ static bool ReadLocalUiFile(const std::string& resourceName, const std::string& 
 		return false;
 	out.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
 	return true;
+}
+
+std::vector<std::string> ResourceManager::LocalUiResources()
+{
+	std::vector<std::string> out;
+	std::error_code ec;
+	for (const auto& e : std::filesystem::directory_iterator(nvui::Root(), ec))
+	{
+		std::string name;
+		if (e.is_regular_file(ec) && e.path().extension() == ".nvpak") name = e.path().stem().string();
+		else if (e.is_directory(ec)) name = e.path().filename().string();
+		if (!name.empty() && HasLocalUi(name) && std::find(out.begin(), out.end(), name) == out.end())
+			out.push_back(name);
+	}
+	return out;
 }
 
 void ResourceManager::SetDownloadDialog(DownloadDialog& dialog)

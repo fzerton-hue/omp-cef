@@ -41,6 +41,9 @@ public:
 
 	void Initialize();
 
+	// Next-Vision: numele interfetelor locale din <joc>\\cef\\ui (pachete .nvpak sau foldere)
+	static std::vector<std::string> LocalUiResources();
+
 	// Controls the internal CEF loader UI shown during resource downloads.
 	// When false, downloads occur silently without opening the internal loader browser.
 	void SetResourcesLoaderUiEnabled(bool enabled);
